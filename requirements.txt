@@ -1,0 +1,22 @@
+# requirements.txt
+# Pinned to the versions used in the original Kaggle T4 environment.
+# Install with:  pip install -r requirements.txt
+
+# Core deep-learning stack
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
+# HuggingFace ecosystem
+transformers==4.45.2
+accelerate==0.33.0
+bitsandbytes==0.43.3
+datasets>=2.18.0
+
+# Numerical / vision
+numpy<2.0.0
+Pillow>=10.0.0
+requests>=2.31.0
+
+# Progress bars
+tqdm>=4.66.0
