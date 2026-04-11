@@ -1,17 +1,15 @@
 """
-src/decoding/dcla_decode.py
-===========================
-Dynamic Contrastive Logit Adjustment (DCLA) — dual-pass greedy decoding engine.
+Dynamic Contrastive Logit Adjustment (DCLA) decoding.
 
-At each decode step two distributions are computed:
-  Pass-1 (IGAP off): standard language prior from the original KV cache.
-  Pass-2 (IGAP on): image-grounded distribution from attended-embed KV cache.
+Dual-pass per decode step:
+1) Pass-1 (IGAP off): baseline language prior.
+2) Pass-2 (IGAP on): image-grounded logits.
 
-Routing (in order of precedence):
-  max_prob > CONFIDENCE_GATE  ->  greedy (baseline logits)
-  JS <= js_threshold          ->  complementary: logits_orig + a1 * logits_igap
-  JS >  js_threshold          ->  contrastive:   (1+a2)*logits_orig - a2*logits_igap
-                                  + APC mask (tokens below APC_FRACTION of max set to -inf)
+Routing:
+- Confidence Gate: ``max_prob > c``        -> greedy pass-1 token.
+- Complementary Amplification (low JS):    -> ``logits_1 + a1 * logits_2``.
+- Contrastive Suppression (high JS):       -> ``(1+a2)*logits_1 - a2*logits_2``
+  plus APC plausibility mask.
 """
 
 from __future__ import annotations
@@ -42,105 +40,148 @@ def dynamic_decode_one_sample(
     alpha2: float = 1.0,
     lam: float = 0.2,
     token_alpha: float = 0.06,
+    confidence_gate: float = CONFIDENCE_GATE,
+    apc_fraction: float = APC_FRACTION,
 ) -> Tuple[str, List[Tuple[int, float, str]]]:
-    """Run DCLA dual-pass greedy decoding for one vision-language sample.
+    """Run DCLA dual-pass decoding on one image-question sample.
 
-    Returns (answer_string, per_step_trace).
-    trace entries: (token_id, js_divergence, routing_mode)
-    routing_mode in {"greedy", "complement", "contrast"}.
+    Returns:
+    - decoded answer string
+    - decode trace as ``[(token_id, js_divergence, mode), ...]``
     """
     lm_device: torch.device = next(model.language_model.parameters()).device
 
     vision_inputs = processor(text=prompt, images=image, return_tensors="pt", padding=True)
-    for key, val in vision_inputs.items():
-        if torch.is_tensor(val):
-            vision_inputs[key] = val.to(
-                lm_device,
-                dtype=(torch.float16 if key == "pixel_values" else None),
-            )
+    for key, value in vision_inputs.items():
+        if torch.is_tensor(value):
+            dtype = torch.float16 if key == "pixel_values" else None
+            vision_inputs[key] = value.to(device=lm_device, dtype=dtype)
 
+    if "pixel_values" not in vision_inputs:
+        raise ValueError("Processor output missing 'pixel_values' for multimodal decoding.")
+
+    base_attention_mask = vision_inputs.get("attention_mask")
+    if base_attention_mask is None:
+        base_attention_mask = torch.ones(
+            (vision_inputs["input_ids"].shape[0], vision_inputs["input_ids"].shape[1]),
+            dtype=torch.long,
+            device=lm_device,
+        )
+    else:
+        base_attention_mask = base_attention_mask.to(device=lm_device, dtype=torch.long)
+
+    # Build pass-2 attended embeddings from IGAP-disabled prefill attentions.
     inputs_embeds_att, att_mask_att = build_attended_embeds(
-        model, vision_inputs, img_start, img_end, lam=lam, token_alpha=token_alpha
+        model=model,
+        vision_inputs=vision_inputs,
+        img_start=img_start,
+        img_end=img_end,
+        lam=lam,
+        token_alpha=token_alpha,
     )
-    inputs_embeds_att = inputs_embeds_att.to(lm_device, dtype=torch.float16)
-    att_mask_att = att_mask_att.to(lm_device)
-    s_merged: int = att_mask_att.shape[1]
-
-    _igap_toggle["active"] = False
-    out1 = model(
-        input_ids=vision_inputs["input_ids"],
-        attention_mask=vision_inputs.get("attention_mask"),
-        pixel_values=vision_inputs["pixel_values"],
-        use_cache=True,
-    )
-    past_kv_1 = out1.past_key_values
-    mask1 = torch.ones((1, s_merged), dtype=torch.long, device=lm_device)
-
-    _igap_toggle["active"] = True
-    out2 = model(inputs_embeds=inputs_embeds_att, attention_mask=att_mask_att, use_cache=True)
-    past_kv_2 = out2.past_key_values
-    mask2 = att_mask_att.clone()
-    _igap_toggle["active"] = False
+    model_dtype = next(model.parameters()).dtype
+    inputs_embeds_att = inputs_embeds_att.to(device=lm_device, dtype=model_dtype)
+    att_mask_att = att_mask_att.to(device=lm_device, dtype=torch.long)
 
     generated_ids: List[int] = []
     trace: List[Tuple[int, float, str]] = []
-    next_id: torch.Tensor = torch.zeros((1, 1), dtype=torch.long, device=lm_device)
+    next_token = torch.zeros((1, 1), dtype=torch.long, device=lm_device)
 
-    for step in range(max_new_tokens):
-        if step == 0:
-            logits_orig: torch.Tensor = out1.logits[0, -1].float()
-            logits_igap: torch.Tensor = out2.logits[0, -1].float()
-        else:
-            _igap_toggle["active"] = False
-            d1 = model(input_ids=next_id, attention_mask=mask1, past_key_values=past_kv_1, use_cache=True)
-            logits_orig = d1.logits[0, -1].float()
-            past_kv_1 = d1.past_key_values
+    try:
+        # Prefill pass-1 (IGAP OFF)
+        _igap_toggle["active"] = False
+        out_pass1 = model(
+            input_ids=vision_inputs["input_ids"],
+            attention_mask=base_attention_mask,
+            pixel_values=vision_inputs["pixel_values"],
+            use_cache=True,
+        )
+        past_kv_pass1 = out_pass1.past_key_values
+        mask_pass1 = base_attention_mask.clone()
 
-            _igap_toggle["active"] = True
-            d2 = model(input_ids=next_id, attention_mask=mask2, past_key_values=past_kv_2, use_cache=True)
-            logits_igap = d2.logits[0, -1].float()
-            past_kv_2 = d2.past_key_values
-            _igap_toggle["active"] = False
+        # Prefill pass-2 (IGAP ON)
+        _igap_toggle["active"] = True
+        out_pass2 = model(
+            inputs_embeds=inputs_embeds_att,
+            attention_mask=att_mask_att,
+            use_cache=True,
+        )
+        past_kv_pass2 = out_pass2.past_key_values
+        mask_pass2 = att_mask_att.clone()
 
-        eps: float = 1e-8
-        p = F.softmax(logits_orig, dim=-1)
-        q = F.softmax(logits_igap, dim=-1)
-        m = 0.5 * (p + q)
-        js: float = 0.5 * (
-            torch.sum(p * (torch.log(p + eps) - torch.log(m + eps)))
-            + torch.sum(q * (torch.log(q + eps) - torch.log(m + eps)))
-        ).item()
+        logits_pass1 = out_pass1.logits[0, -1].float()
+        logits_pass2 = out_pass2.logits[0, -1].float()
 
-        base_probs = p
-        max_prob: float = torch.max(base_probs).item()
+        eos_token_id = processor.tokenizer.eos_token_id
 
-        if max_prob > CONFIDENCE_GATE:
-            final_logits = logits_orig.clone()
-            mode = "greedy"
-        elif js <= js_threshold:
-            final_logits = logits_orig + alpha1 * logits_igap
-            mode = "complement"
-        else:
-            final_logits = (1.0 + alpha2) * logits_orig - alpha2 * logits_igap
-            plausible_mask = base_probs >= APC_FRACTION * max_prob
-            final_logits[~plausible_mask] = -float("inf")
-            mode = "contrast"
+        for step in range(max_new_tokens):
+            if step > 0:
+                _igap_toggle["active"] = False
+                step_pass1 = model(
+                    input_ids=next_token,
+                    attention_mask=mask_pass1,
+                    past_key_values=past_kv_pass1,
+                    use_cache=True,
+                )
+                logits_pass1 = step_pass1.logits[0, -1].float()
+                past_kv_pass1 = step_pass1.past_key_values
 
-        next_id = torch.argmax(final_logits, dim=-1).view(1, 1)
-        token_id: int = int(next_id.item())
-        generated_ids.append(token_id)
-        trace.append((token_id, round(js, 5), mode))
+                _igap_toggle["active"] = True
+                step_pass2 = model(
+                    input_ids=next_token,
+                    attention_mask=mask_pass2,
+                    past_key_values=past_kv_pass2,
+                    use_cache=True,
+                )
+                logits_pass2 = step_pass2.logits[0, -1].float()
+                past_kv_pass2 = step_pass2.past_key_values
 
-        ones = torch.ones((1, 1), dtype=torch.long, device=lm_device)
-        mask1 = torch.cat([mask1, ones], dim=1)
-        mask2 = torch.cat([mask2, ones], dim=1)
+            p = F.softmax(logits_pass1, dim=-1)
+            q = F.softmax(logits_pass2, dim=-1)
+            m = 0.5 * (p + q)
+            eps = 1e-8
+            js_divergence = 0.5 * (
+                torch.sum(p * (torch.log(p + eps) - torch.log(m + eps)))
+                + torch.sum(q * (torch.log(q + eps) - torch.log(m + eps)))
+            ).item()
 
-        if token_id == processor.tokenizer.eos_token_id:
-            break
+            max_prob = float(torch.max(p).item())
+            if max_prob > confidence_gate:
+                final_logits = logits_pass1.clone()
+                mode = "greedy"
+            elif js_divergence <= js_threshold:
+                final_logits = logits_pass1 + (alpha1 * logits_pass2)
+                mode = "complement"
+            else:
+                final_logits = ((1.0 + alpha2) * logits_pass1) - (alpha2 * logits_pass2)
+                apc_mask = p >= (apc_fraction * max_prob)
+                if not bool(torch.any(apc_mask)):
+                    apc_mask[torch.argmax(p)] = True
+                final_logits = final_logits.masked_fill(
+                    ~apc_mask,
+                    torch.finfo(final_logits.dtype).min,
+                )
+                mode = "contrast"
 
-    answer_ids = torch.tensor([generated_ids], device=lm_device)
-    answer: str = processor.batch_decode(
-        answer_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0].strip()
+            next_token = torch.argmax(final_logits, dim=-1).view(1, 1)
+            token_id = int(next_token.item())
+            generated_ids.append(token_id)
+            trace.append((token_id, round(js_divergence, 6), mode))
+
+            if eos_token_id is not None and token_id == int(eos_token_id):
+                break
+
+            one = torch.ones((1, 1), dtype=torch.long, device=lm_device)
+            mask_pass1 = torch.cat([mask_pass1, one], dim=1)
+            mask_pass2 = torch.cat([mask_pass2, one], dim=1)
+
+    finally:
+        _igap_toggle["active"] = False
+
+    answer = processor.tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ).strip()
 
     return answer, trace

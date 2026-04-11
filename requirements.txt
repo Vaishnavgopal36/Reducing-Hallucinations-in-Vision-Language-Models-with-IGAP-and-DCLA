@@ -1,6 +1,4 @@
-# requirements.txt
-# Pinned to the versions used in the original Kaggle T4 environment.
-# Install with:  pip install -r requirements.txt
+
 
 # Core deep-learning stack
 torch==2.2.2

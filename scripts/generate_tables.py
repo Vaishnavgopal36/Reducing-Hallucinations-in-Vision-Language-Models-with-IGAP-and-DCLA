@@ -1,24 +1,7 @@
 """
-scripts/generate_tables.py
-==========================
-Aggregate all evaluation JSONs and print the MMHal and POPE results tables.
-
-MMHal Table
------------
-Reads ``eval/eval_*.json`` files and prints a per-category (8 categories)
-+ overall score table.
-
-POPE Table
-----------
-Reads ``pope_results/*.json`` files and prints Accuracy, F1, and Yes%-bias
-across all three splits (Random / Popular / Adversarial) plus an Overall
-column.
-
-Usage
------
-Run from the repository root after both evaluation scripts have completed::
-
-    PYTHONPATH=. python scripts/generate_tables.py
+Generate terminal tables matching the paper's evaluation structure:
+- Table 1: MMHal-Bench category scores + overall
+- Table 2: POPE split-wise metrics (Acc, F1, Yes-bias) + overall
 """
 
 from __future__ import annotations
@@ -26,199 +9,106 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.eval.metrics import QUESTION_TYPE_NAMES, get_stats, pope_metrics
 
-# ---------------------------------------------------------------------------
-# Path configuration
-# ---------------------------------------------------------------------------
-EVAL_DIR: str = "eval"
-POPE_RESULTS_DIR: str = "pope_results"
-
+EVAL_DIR: Path = Path("eval")
+POPE_RESULTS_DIR: Path = Path("pope_results")
+BENCHMARKS: List[str] = ["baseline", "spin", "mod", "igap_dcla"]
 POPE_SPLITS: List[str] = ["random", "popular", "adversarial"]
 
-# Display-order config for MMHal
-MMHAL_RUNS: Dict[str, str] = {
-    "Baseline":   os.path.join(EVAL_DIR, "eval_baseline.json"),
-    "Just IGAP":  os.path.join(EVAL_DIR, "eval_just_igap.json"),
-    "Just DCLA":  os.path.join(EVAL_DIR, "eval_just_dcla.json"),
-    "IGAP-DCLA":  os.path.join(EVAL_DIR, "eval_igap_dcla.json"),
-}
 
-# Display-order config for POPE
-POPE_VARIANTS: Dict[str, str] = {
-    "Baseline":   "baseline",
-    "Just IGAP":  "just_igap",
-    "Just DCLA":  "just_dcla",
-    "IGAP-DCLA":  "igap_dcla",
-}
-
-
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-def _fmt(value: Optional[float], width: int = 10, decimals: int = 2) -> str:
-    """Format a float for a fixed-width table column."""
+def _fmt(value: Optional[float], decimals: int = 2) -> str:
     if value is None:
-        return "N/A".ljust(width)
-    return f"{value:.{decimals}f}".rjust(width)
+        return "  N/A"
+    return f"{value:.{decimals}f}".rjust(6)
 
 
-def _hr(width: int, char: str = "-") -> str:
-    return char * width
-
-
-# ---------------------------------------------------------------------------
-# MMHal table
-# ---------------------------------------------------------------------------
-
-def print_mmhal_table() -> None:
-    """Load evaluation JSONs and print the MMHal-Bench results table."""
-    col_width: int = 12
-    label_width: int = 16
-
-    # Column headers
-    run_names = list(MMHAL_RUNS.keys())
-    header_row = f"{'Category':<{label_width}}" + "".join(
-        n.rjust(col_width) for n in run_names
-    )
-    sep = _hr(label_width + col_width * len(run_names))
-
-    print("\n" + "=" * len(sep))
-    print("  MMHal-Bench Average Scores (0–6, higher is better)")
-    print("=" * len(sep))
-    print(header_row)
-    print(sep)
-
-    # Load stats once
-    all_stats: Dict[str, Optional[Dict[str, float]]] = {
-        name: get_stats(path) for name, path in MMHAL_RUNS.items()
-    }
-
-    for cat in QUESTION_TYPE_NAMES:
-        row = f"{cat.capitalize():<{label_width}}"
-        for run_name in run_names:
-            stats = all_stats[run_name]
-            val = stats.get(cat) if stats else None
-            row += _fmt(val, width=col_width)
-        print(row)
-
-    print(sep)
-    # Overall row
-    row = f"{'OVERALL':<{label_width}}"
-    for run_name in run_names:
-        stats = all_stats[run_name]
-        val = stats.get("OVERALL") if stats else None
-        row += _fmt(val, width=col_width)
-    print(row)
-    print("=" * len(sep))
-
-
-# ---------------------------------------------------------------------------
-# POPE table
-# ---------------------------------------------------------------------------
-
-def _load_pope_split(
-    variant_key: str, split_name: str
-) -> Optional[Dict[str, float]]:
-    """Load pope_results/{variant_key}_{split_name}.json and compute metrics."""
-    fpath = os.path.join(POPE_RESULTS_DIR, f"{variant_key}_{split_name}.json")
-    if not os.path.exists(fpath):
+def _load_pope_metrics(benchmark: str, split_name: str) -> Optional[Dict[str, float]]:
+    file_path = POPE_RESULTS_DIR / f"{benchmark}_{split_name}.json"
+    if not file_path.exists():
         return None
-    with open(fpath, "r", encoding="utf-8") as fh:
-        records: List[Dict[str, str]] = json.load(fh)
-    return pope_metrics(records)
+    with file_path.open("r", encoding="utf-8") as file_obj:
+        rows = json.load(file_obj)
+    return pope_metrics(rows)
 
 
-def _pope_overall(
-    per_split: Dict[str, Optional[Dict[str, float]]]
-) -> Optional[Dict[str, float]]:
-    """Macro-average Accuracy and F1 across available splits."""
-    vals = [v for v in per_split.values() if v is not None]
-    if not vals:
-        return None
+def _macro_average(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
     return {
-        "acc": round(sum(v["acc"] for v in vals) / len(vals), 2),
-        "f1":  round(sum(v["f1"]  for v in vals) / len(vals), 2),
+        "acc": sum(x["acc"] for x in metrics_list) / len(metrics_list),
+        "f1": sum(x["f1"] for x in metrics_list) / len(metrics_list),
+        "yes_pct": sum(x["yes_pct"] for x in metrics_list) / len(metrics_list),
     }
 
 
-def print_pope_table() -> None:
-    """Load POPE result JSONs and print the accuracy / F1 / Yes-bias table."""
-    # Pre-load all split metrics
-    all_pope: Dict[str, Dict[str, Optional[Dict[str, float]]]] = {}
-    for display_name, variant_key in POPE_VARIANTS.items():
-        all_pope[display_name] = {
-            split: _load_pope_split(variant_key, split)
-            for split in POPE_SPLITS
-        }
+def print_table_1_mmhal() -> None:
+    print("\n" + "=" * 120)
+    print("Table 1: MMHal-Bench (score 0-6, higher is better)")
+    print("=" * 120)
 
-    col_w: int = 9        # width per metric column pair
-    label_w: int = 16
-    split_cols = POPE_SPLITS + ["overall"]
-    split_labels = ["Random", "Popular", "Adversarial", "Overall"]
+    headers = ["method", *QUESTION_TYPE_NAMES, "overall"]
+    print(" | ".join(h.ljust(12) for h in headers))
+    print("-" * 120)
 
-    # Header rows
-    top_sep = "=" * (label_w + col_w * 2 * len(split_cols) + len(split_cols) * 2)
-
-    print("\n" + top_sep)
-    print("  POPE Evaluation Table")
-    print(top_sep)
-
-    # Sub-header: split names spanning 2 metric cols each
-    sub_hdr = " " * label_w
-    for slabel in split_labels:
-        sub_hdr += slabel.center(col_w * 2 + 2)
-    print(sub_hdr)
-
-    # Metric sub-header
-    metric_hdr = f"{'Method':<{label_w}}"
-    for _ in split_labels:
-        metric_hdr += "Acc(%)".rjust(col_w) + "F1(%)".rjust(col_w) + "  "
-    print(metric_hdr)
-    print(_hr(len(top_sep)))
-
-    for display_name in POPE_VARIANTS:
-        row = f"{display_name:<{label_w}}"
-        per_split = all_pope[display_name]
-        ov = _pope_overall(per_split)
-        for split in POPE_SPLITS:
-            m = per_split.get(split)
-            row += _fmt(m["acc"] if m else None, width=col_w)
-            row += _fmt(m["f1"]  if m else None, width=col_w)
-            row += "  "
-        row += _fmt(ov["acc"] if ov else None, width=col_w)
-        row += _fmt(ov["f1"]  if ov else None, width=col_w)
-        row += "  "
-        print(row)
-
-    print(top_sep)
-
-    # Yes-bias sub-table
-    print("\n" + _hr(70))
-    print("Yes% Bias  (ideal ~50%  |  >70% = over-predicts 'yes' = hallucination bias)")
-    print(_hr(70))
-    print(f"  {'Method':<20}" + "".join(f"{s:>14}" for s in split_labels[:-1]))
-    for display_name, variant_key in POPE_VARIANTS.items():
-        row = f"  {display_name:<20}"
-        for split in POPE_SPLITS:
-            m = _load_pope_split(variant_key, split)
-            row += f"{(str(m['yes_pct']) + '%') if m else 'N/A':>14}"
-        print(row)
-    print(_hr(70))
+    for benchmark in BENCHMARKS:
+        stats = get_stats(str(EVAL_DIR / f"eval_{benchmark}.json"))
+        row_values: List[str] = [benchmark.ljust(12)]
+        for category in QUESTION_TYPE_NAMES:
+            value = stats.get(category) if stats else None
+            row_values.append(_fmt(value).rjust(12))
+        overall = stats.get("OVERALL") if stats else None
+        row_values.append(_fmt(overall).rjust(12))
+        print(" | ".join(row_values))
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def print_table_2_pope() -> None:
+    print("\n" + "=" * 120)
+    print("Table 2: POPE (Accuracy/F1/Yes-bias %) across splits")
+    print("=" * 120)
+
+    header = [
+        "method",
+        "random_acc",
+        "random_f1",
+        "random_yes",
+        "popular_acc",
+        "popular_f1",
+        "popular_yes",
+        "adversarial_acc",
+        "adversarial_f1",
+        "adversarial_yes",
+        "overall_acc",
+        "overall_f1",
+        "overall_yes",
+    ]
+    print(" | ".join(h.ljust(14) for h in header))
+    print("-" * 120)
+
+    for benchmark in BENCHMARKS:
+        split_metrics = [_load_pope_metrics(benchmark, split_name) for split_name in POPE_SPLITS]
+        valid = [x for x in split_metrics if x is not None]
+        overall = _macro_average(valid) if valid else None
+
+        row: List[str] = [benchmark.ljust(14)]
+        for metric in split_metrics:
+            row.append(_fmt(metric["acc"] if metric else None).rjust(14))
+            row.append(_fmt(metric["f1"] if metric else None).rjust(14))
+            row.append(_fmt(metric["yes_pct"] if metric else None).rjust(14))
+
+        row.append(_fmt(overall["acc"] if overall else None).rjust(14))
+        row.append(_fmt(overall["f1"] if overall else None).rjust(14))
+        row.append(_fmt(overall["yes_pct"] if overall else None).rjust(14))
+
+        print(" | ".join(row))
+
 
 def main() -> None:
-    print_mmhal_table()
-    print_pope_table()
+    print_table_1_mmhal()
+    print_table_2_pope()
 
 
 if __name__ == "__main__":

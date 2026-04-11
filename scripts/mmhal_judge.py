@@ -1,31 +1,17 @@
 """
-scripts/mmhal_judge.py
-======================
-MMHal-Bench automated scoring script using Qwen2.5-3B-Instruct as judge.
+MMHal-Bench judge pipeline using Qwen/Qwen2.5-3B-Instruct.
 
-For each of the four result files produced by ``mmhal_inference.py``, this
-script formats the judge prompt, queries the local Qwen model, and writes a
-corresponding ``eval_*.json`` file.
+Reads:
+- results/response_baseline.json
+- results/response_spin.json
+- results/response_mod.json
+- results/response_igap_dcla.json
 
-Input files (must exist in ``results/``)
------------------------------------------
-* ``response_baseline.json``
-* ``response_just_igap.json``
-* ``response_just_dcla.json``
-* ``response_igap_dcla.json``
-
-Output files (written to ``eval/``)
--------------------------------------
-* ``eval_baseline.json``
-* ``eval_just_igap.json``
-* ``eval_just_dcla.json``
-* ``eval_igap_dcla.json``
-
-Usage
------
-Run from the repository root::
-
-    PYTHONPATH=. python scripts/mmhal_judge.py
+Writes:
+- eval/eval_baseline.json
+- eval/eval_spin.json
+- eval/eval_mod.json
+- eval/eval_igap_dcla.json
 """
 
 from __future__ import annotations
@@ -33,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -43,101 +30,51 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.eval.judge_prompts import TEMPLATE
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 JUDGE_MODEL_ID: str = "Qwen/Qwen2.5-3B-Instruct"
-RESULTS_DIR: str = "results"
-EVAL_DIR: str = "eval"
-
-# Maps result files → evaluation output files
-EVAL_TASKS: List[Dict[str, str]] = [
-    {
-        "input":  os.path.join(RESULTS_DIR, "response_baseline.json"),
-        "output": os.path.join(EVAL_DIR, "eval_baseline.json"),
-    },
-    {
-        "input":  os.path.join(RESULTS_DIR, "response_just_igap.json"),
-        "output": os.path.join(EVAL_DIR, "eval_just_igap.json"),
-    },
-    {
-        "input":  os.path.join(RESULTS_DIR, "response_just_dcla.json"),
-        "output": os.path.join(EVAL_DIR, "eval_just_dcla.json"),
-    },
-    {
-        "input":  os.path.join(RESULTS_DIR, "response_igap_dcla.json"),
-        "output": os.path.join(EVAL_DIR, "eval_igap_dcla.json"),
-    },
-]
-
+RESULTS_DIR: Path = Path("results")
+EVAL_DIR: Path = Path("eval")
+BENCHMARKS: List[str] = ["baseline", "spin", "mod", "igap_dcla"]
 JUDGE_MAX_NEW_TOKENS: int = 256
 
 
-# ---------------------------------------------------------------------------
-# Judge helper
-# ---------------------------------------------------------------------------
+def _format_image_content(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(x) for x in value)
+    return str(value or "")
 
-def get_local_rating(
-    tokenizer: AutoTokenizer,
-    judge_model: AutoModelForCausalLM,
-    prompt: str,
-) -> str:
-    """Query the Qwen judge model and return its raw text output.
 
-    Parameters
-    ----------
-    tokenizer:
-        Tokenizer for the Qwen judge model.
-    judge_model:
-        Loaded ``AutoModelForCausalLM`` inference model.
-    prompt:
-        The formatted judge prompt (already filled with image/question/answer).
-
-    Returns
-    -------
-    str
-        The full judge response, including explanation and ``Rating: N`` line.
-    """
+def get_local_rating(tokenizer: AutoTokenizer, judge_model: AutoModelForCausalLM, prompt: str) -> str:
+    """Run one local judge-model evaluation and return raw output text."""
     messages = [
         {
             "role": "system",
             "content": (
-                "You are an impartial AI Judge. Evaluate the response based on "
-                "accuracy and hallucination. Output the Explanation first, then "
-                "the Rating."
+                "You are an impartial multimodal evaluator. "
+                "Provide a concise explanation followed by a line: Rating: <0-6>."
             ),
         },
         {"role": "user", "content": prompt},
     ]
 
-    text: str = tokenizer.apply_chat_template(
+    chat_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
-    model_inputs = tokenizer([text], return_tensors="pt").to(judge_model.device)
+    model_inputs = tokenizer([chat_text], return_tensors="pt").to(judge_model.device)
 
-    generated_ids = judge_model.generate(
+    generated = judge_model.generate(
         **model_inputs,
         max_new_tokens=JUDGE_MAX_NEW_TOKENS,
         do_sample=False,
-        temperature=1.0,          # ignored when do_sample=False; silences warnings
     )
-    # Strip the prompt tokens from the output
-    output_ids = [
-        out[len(inp):]
-        for inp, out in zip(model_inputs.input_ids, generated_ids)
-    ]
-    return tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    completion_ids = generated[:, model_inputs.input_ids.shape[1] :]
+    return tokenizer.batch_decode(completion_ids, skip_special_tokens=True)[0]
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.makedirs(EVAL_DIR, exist_ok=True)
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading judge model: {JUDGE_MODEL_ID}")
     tokenizer = AutoTokenizer.from_pretrained(JUDGE_MODEL_ID, trust_remote_code=True)
@@ -147,46 +84,50 @@ def main() -> None:
         device_map="auto",
         trust_remote_code=True,
     )
-    print("✅ Judge model loaded.")
 
-    for task in EVAL_TASKS:
-        input_path: str = task["input"]
-        output_path: str = task["output"]
+    for benchmark in BENCHMARKS:
+        input_path = RESULTS_DIR / f"response_{benchmark}.json"
+        output_path = EVAL_DIR / f"eval_{benchmark}.json"
 
-        if not os.path.exists(input_path):
-            print(f"⚠️  Skipping {input_path}: file not found.")
+        if not input_path.exists():
+            print(f"Skipping {benchmark}: missing {input_path}")
             continue
 
-        print(f"\n👨‍⚖️  Judging: {os.path.basename(input_path)}")
-        with open(input_path, "r", encoding="utf-8") as fh:
-            records: List[Dict[str, Any]] = json.load(fh)
+        with input_path.open("r", encoding="utf-8") as file_obj:
+            records: List[Dict[str, Any]] = json.load(file_obj)
 
         evaluations: List[Dict[str, Any]] = []
-
-        for i, record in tqdm(enumerate(records), total=len(records)):
-            image_content: str = ", ".join(record.get("image_content", []))
-            prompt_text: str = TEMPLATE.format(
-                image_content,
+        for idx, record in tqdm(
+            enumerate(records),
+            total=len(records),
+            desc=f"[judge:{benchmark}]",
+        ):
+            prompt = TEMPLATE.format(
+                _format_image_content(record.get("image_content", "")),
                 record.get("question", ""),
                 record.get("gt_answer", ""),
                 record.get("model_answer", ""),
             )
 
             try:
-                response: str = get_local_rating(tokenizer, judge_model, prompt_text)
-                evaluations.append({
-                    "id":            i,
-                    "question_type": (record.get("question_type") or "other").lower(),
-                    "response":      response,
-                })
+                judge_response = get_local_rating(tokenizer, judge_model, prompt)
             except Exception as exc:
-                print(f"❌ Error on sample {i}: {exc}")
+                judge_response = f"ERROR: {exc}"
 
-        with open(output_path, "w", encoding="utf-8") as fh:
-            json.dump(evaluations, fh, indent=2)
-        print(f"✅ Saved {len(evaluations)} evaluations → {output_path}")
+            evaluations.append(
+                {
+                    "id": idx,
+                    "benchmark": benchmark,
+                    "question_type": str(record.get("question_type", "other")).strip().lower(),
+                    "response": judge_response,
+                }
+            )
 
-    print("\n🎉 ALL SCORING TASKS COMPLETE.")
+        with output_path.open("w", encoding="utf-8") as file_obj:
+            json.dump(evaluations, file_obj, ensure_ascii=False, indent=2)
+        print(f"Saved {len(evaluations)} judgments to {output_path}")
+
+    print("MMHal judging complete.")
 
 
 if __name__ == "__main__":
