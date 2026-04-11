@@ -146,7 +146,7 @@ def main() -> None:
     rng = get_image_token_range_hf(model, probe_inputs)
     assert rng is not None, "Could not find image token range — check model/processor."
     img_start_idx, img_end_idx = rng
-    print(f"✅ Image token range: [{img_start_idx}, {img_end_idx})")
+    print(f" Image token range: [{img_start_idx}, {img_end_idx})")
 
     # ---- Apply IGAP patch to all layers -------------------------------------
     apply_igap_to_llava(
@@ -242,7 +242,7 @@ def main() -> None:
 
         with open(bench["file"], "w", encoding="utf-8") as fh:
             json.dump(results, fh, indent=2)
-        print(f"✅ Saved {len(results)} results → {bench['file']}")
+        print(f" Saved {len(results)} results → {bench['file']}")
 
         if igap_debug["igap_active_calls"] > 0:
             avg_supp = (
@@ -251,7 +251,7 @@ def main() -> None:
             )
             print(f"   IGAP avg suppressed head fraction: {avg_supp:.3f}")
 
-    print("\n🎉 ALL BENCHMARKS COMPLETE.")
+    print("\nALL BENCHMARKS COMPLETE.")
 
 
 if __name__ == "__main__":
