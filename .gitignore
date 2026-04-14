@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.codex
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model and dataset artifacts
+data/mmhal_data/
+data/test_data.zip
+mmhal_data/
+test_data.zip
+
+# Hugging Face / torch caches
+.cache/
+cache/
+
+# Runtime outputs
+output/
+Report/
+
+# Legacy output directories
+results/
+eval/
+pope_results/
