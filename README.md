@@ -94,23 +94,23 @@ The following values are the reported benchmark numbers for the method variants 
 | random | Baseline | 88.87 | 88.61 |
 | random | SPIN | 87.00 | 86.87 |
 | random | MoD | 86.00 | 86.41 |
-| random | Our Hybrid | 89.09 | 89.87 |
+| random | IGAP-DCLA | 89.09 | 89.87 |
 | popular | Baseline | 86.40 | 86.52 |
 | popular | SPIN | 87.00 | 86.87 |
 | popular | MoD | 82.00 | 81.25 |
-| popular | Our Hybrid | 88.00 | 87.76 |
+| popular | IGAP-DCLA | 88.00 | 87.76 |
 | adversarial | Baseline | 76.00 | 78.18 |
 | adversarial | SPIN | 76.00 | 78.18 |
 | adversarial | MoD | 71.00 | 72.90 |
-| adversarial | Our Hybrid | 79.00 | 80.37 |
+| adversarial | IGAP-DCLA | 79.00 | 80.37 |
 | overall | Baseline | 84.09 | 84.77 |
 | overall | SPIN | 83.33 | 83.97 |
 | overall | MoD | 78.00 | 78.19 |
-| overall | Our Hybrid | 84.67 | 85.00 |
+| overall | IGAP-DCLA | 84.67 | 85.00 |
 
 ### MMHal-Bench
 
-| Category | Baseline | SPIN | MoD | Our Hybrid |
+| Category | Baseline | SPIN | MoD | IGAP-DCLA |
 | --- | ---: | ---: | ---: | ---: |
 | Comparison | 2.33 | 1.92 | 3.00 | 3.42 |
 | Relation | 1.75 | 1.58 | 1.92 | 2.67 |
